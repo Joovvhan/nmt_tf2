@@ -14,7 +14,7 @@ import time
 
 embedding_dim = 256
 enc_units = 128
-batch_sz = 16
+batch_sz = 256
 dec_units = 128
 
 # Converts the unicode file to ascii
@@ -88,6 +88,21 @@ def loss_function(real, pred):
 
     return tf.reduce_mean(loss_)
 
+class ResidualGRU(tf.keras.Model):
+    def __init__(self, units, return_sequences, return_state, recurrent_initializer='glorot_uniform'):
+        super(ResidualGRU, self).__init__()
+        self.gru_layer = tf.keras.layers.GRU(units, return_sequences=return_sequences, return_state=return_state, 
+                                             recurrent_initializer=recurrent_initializer)
+
+    def call(self, input_tensor, initial_state):
+        
+        output_tensor, state = self.gru_layer(input_tensor, initial_state = initial_state)
+
+        residual_ouput_tensor = tf.add(output_tensor, input_tensor)
+        
+        return residual_ouput_tensor, state
+
+
 class Encoder(tf.keras.Model):
     def __init__(self):
         super(Encoder, self).__init__()
@@ -137,41 +152,70 @@ class BahdanauAttention(tf.keras.Model):
 class Decoder(tf.keras.Model):
     def __init__(self, vocab_size):
         super(Decoder, self).__init__()
-        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        # self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
         self.gru = tf.keras.layers.GRU(dec_units,
                                        return_sequences=True,
                                        return_state=True,
                                        recurrent_initializer='glorot_uniform')
+        self.gru2 = ResidualGRU(dec_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+        self.gru3 = ResidualGRU(dec_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+        self.gru4 = ResidualGRU(dec_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+
+        # self.gru2 = tf.keras.layers.GRU(dec_units,
+        #                                return_sequences=True,
+        #                                return_state=True,
+        #                                recurrent_initializer='glorot_uniform')
+
         self.fc = tf.keras.layers.Dense(vocab_size)
         self.attention = BahdanauAttention(dec_units)
         # self.attention = tf.keras.layers.AdditiveAttention()
 
     def call(self, x, hidden, enc_output):
         # enc_output shape == (batch_size, max_length, hidden_size)
-        context_vector, attention_weights = self.attention(hidden, enc_output)
+        context_vector, attention_weights = self.attention(hidden[0], enc_output)
 
         # x shape after passing through embedding == (batch_size, 1, embedding_dim)
-        x = self.embedding(x)
+        # x = self.embedding(x)
 
         # x shape after concatenation == (batch_size, 1, embedding_dim + hidden_size)
         x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
 
         # passing the concatenated vector to the GRU
-        output, state = self.gru(x)
+        output, state1 = self.gru(x, initial_state=hidden[0])
+        
+        output, state2 = self.gru2(output, initial_state=hidden[1])
 
-        # output shape == (batch_size * 1, hidden_size)
+        output, state3 = self.gru3(output, initial_state=hidden[2])
+
+        output, state4 = self.gru4(output, initial_state=hidden[3])
+
         output = tf.reshape(output, (-1, output.shape[2]))
-
 
         # output shape == (batch_size, vocab)
         x = self.fc(output)
 
+        state = [state1, state2, state3, state4]
+
         return x, state, attention_weights
+
+    def initialize_hidden_state(self, batch_size):
+        return [tf.zeros((batch_size, dec_units)), tf.zeros((batch_size, dec_units)), tf.zeros((batch_size, dec_units)), tf.zeros((batch_size, dec_units))]
 
 
 class NMT:
     def __init__(self, vocab_size, inp_lang, targ_lang):
-        self.embedding = tf.keras.layers.Embedding(vocab_size[0], embedding_dim)
+        self.embedding_enc = tf.keras.layers.Embedding(vocab_size[0], embedding_dim)
+        self.embedding_dec = tf.keras.layers.Embedding(vocab_size[1], embedding_dim)
+
         self.encoder = Encoder()
         self.decoder = Decoder(vocab_size[1])
         # self.attention = tf.keras.layers.AdditiveAttention()
@@ -191,20 +235,25 @@ class NMT:
         hidden_state = self.encoder.initialize_hidden_state()
 
         with tf.GradientTape() as tape:
-            outputs = self.embedding(inputs)
+            outputs = self.embedding_enc(inputs)
 
             enc_output, enc_hidden = self.encoder(outputs, hidden_state)
 
+            dec_hiddens = self.decoder.initialize_hidden_state(batch_sz)
             dec_hidden = enc_hidden
+            dec_hiddens[0] = dec_hidden
 
             dec_input = tf.expand_dims([self.targ_lang.word_index['<start>']] * batch_sz, 1)
 
             for t in range(1, targets.shape[1]):
                 # passing enc_output to the decoder
-                predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output)
 
-                print(predictions.shape)
-                print(targets.shape)
+                dec_input_embed = self.embedding_dec(dec_input)
+
+                predictions, dec_hiddens, _ = self.decoder(dec_input_embed, dec_hiddens, enc_output)
+
+                # print(predictions.shape)
+                # print(targets.shape)
 
                 loss += loss_function(targets[:, t], predictions)
 
@@ -213,7 +262,7 @@ class NMT:
 
         batch_loss = (loss / int(targets.shape[1]))
 
-        variables = self.embedding.trainable_variables + self.encoder.trainable_variables + self.decoder.trainable_variables
+        variables = self.embedding_enc.trainable_variables + self.encoder.trainable_variables + self.embedding_dec.trainable_variables + self.decoder.trainable_variables
 
         gradients = tape.gradient(loss, variables)
 
@@ -234,23 +283,25 @@ class NMT:
 
         inputs = tf.convert_to_tensor(inputs)
 
-        # inputs = tf.reshape(inputs, [1, -1, 1])
-
-        # inputs = tf.cast(inputs, tf.float32)
-
         result = ''
 
         hidden = tf.zeros((1, enc_units))
-
-        inputs = self.embedding(inputs)
+        inputs = self.embedding_enc(inputs)
         enc_out, enc_hidden = self.encoder(inputs, hidden)
 
+        dec_hiddens = self.decoder.initialize_hidden_state(batch_size=1)
         dec_hidden = enc_hidden
+        dec_hiddens[0] = dec_hidden
+
+        # dec_hidden = enc_hidden
         dec_input = tf.expand_dims([self.targ_lang.word_index['<start>']], 0)
 
         for t in range(max_length_targ):
-            predictions, dec_hidden, attention_weights = self.decoder(dec_input,
-                                                                 dec_hidden,
+
+            dec_input_embed = self.embedding_dec(dec_input)
+
+            predictions, dec_hiddens, attention_weights = self.decoder(dec_input_embed,
+                                                                 dec_hiddens,
                                                                  enc_out)
 
             # storing the attention weights to plot later on
